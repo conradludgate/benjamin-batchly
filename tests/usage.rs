@@ -1,8 +1,5 @@
 use benjamin_batchly::{BatchMutex, BatchResult};
-use std::{
-    mem,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn batch_all_ok() {
@@ -159,7 +156,8 @@ async fn handle_batch_in_100ms(
         BatchResult::Done(_) => (HandleResult::Done(()), Instant::now()),
         BatchResult::Failed => (HandleResult::Failed, Instant::now()),
         BatchResult::Work(mut batch) => {
-            assert_eq!(batch.items[0], item);
+            let items: Vec<_> = batch.into_iter().collect();
+            assert_eq!(items[0], item);
 
             // simuluate some io
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -168,7 +166,7 @@ async fn handle_batch_in_100ms(
             // notify that each task succeeded
             batch.notify_all_done();
 
-            (HandleResult::DidWork(mem::take(&mut batch.items)), finish)
+            (HandleResult::DidWork(items), finish)
         }
     }
 }
@@ -183,11 +181,13 @@ async fn lock_30ms_pull_waiting_items_and_handle_in_50ms(
         BatchResult::Done(_) => (HandleResult::Done(()), Instant::now()),
         BatchResult::Failed => (HandleResult::Failed, Instant::now()),
         BatchResult::Work(mut batch) => {
-            assert_eq!(batch.items[0], item);
+            let mut items: Vec<_> = batch.into_iter().collect();
+            assert_eq!(items[0], item);
 
             // simuluate some initial io (like a distributed lock)
             tokio::time::sleep(Duration::from_millis(30)).await;
             batch.pull_waiting_items();
+            items.extend(&mut batch);
 
             // simuluate some io
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -196,7 +196,7 @@ async fn lock_30ms_pull_waiting_items_and_handle_in_50ms(
             // notify that each task succeeded
             batch.notify_all_done();
 
-            (HandleResult::DidWork(mem::take(&mut batch.items)), finish)
+            (HandleResult::DidWork(items), finish)
         }
     }
 }
@@ -223,7 +223,7 @@ async fn handle_convert_to_u32_if_even(
         BatchResult::Done(v) => ToU32Result::Done(v),
         BatchResult::Failed => ToU32Result::Failed,
         BatchResult::Work(mut batch) => {
-            let items = mem::take(&mut batch.items);
+            let items: Vec<_> = batch.into_iter().collect();
 
             // simuluate some io
             tokio::time::sleep(Duration::from_millis(100)).await;

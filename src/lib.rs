@@ -12,13 +12,13 @@
 //! let batcher = BatchMutex::default();
 //!
 //! # let (batch_key, item) = (1, 2);
-//! # async fn db_bulk_insert(_: &[i32]) -> Result<(), &'static str> { Ok(()) }
+//! # async fn db_bulk_insert(_: impl IntoIterator<Item=i32>) -> Result<(), &'static str> { Ok(()) }
 //! // BatchMutex synchronizes so only one `Work` happens at a time (for a given batch_key).
 //! // All concurrent submissions made while an existing `Work` is being processed will
 //! // await completion and form the next `Work` batch.
 //! match batcher.submit(batch_key, item).await {
 //!     BatchResult::Work(mut batch) => {
-//!         db_bulk_insert(&batch.items).await?;
+//!         db_bulk_insert(&mut batch).await?;
 //!         batch.notify_all_done();
 //!         Ok(())
 //!     }
@@ -41,10 +41,10 @@
 //! let batcher: BatchMutex<_, _, anyhow::Result<()>> = BatchMutex::default();
 //!
 //! # let (batch_key, my_item) = (1, 2);
-//! # async fn db_bulk_insert(_: &[i32]) -> Vec<(usize, bool)> { <_>::default() }
+//! # async fn db_bulk_insert(_: impl IntoIterator<Item=i32>) -> Vec<(usize, bool)> { <_>::default() }
 //! match batcher.submit(batch_key, my_item).await {
 //!     BatchResult::Work(mut batch) => {
-//!         let results = db_bulk_insert(&batch.items).await;
+//!         let results = db_bulk_insert(&mut batch).await;
 //!
 //!         // iterate over results and notify each item's submitter
 //!         for (index, success) in results {
@@ -165,13 +165,13 @@ where
     /// # async fn example() -> Result<(), &'static str> {
     /// # let batcher = BatchMutex::default();
     /// # let (batch_key, item) = (1, 2);
-    /// # async fn db_bulk_insert(_: &[i32]) -> Result<(), &'static str> { Ok(()) }
+    /// # async fn db_bulk_insert(_: impl IntoIterator<Item=i32>) -> Result<(), &'static str> { Ok(()) }
     /// // Synchronizes so only one `Work` happens at a time (for a given batch_key).
     /// // All concurrent submissions made while an existing `Work` is being processed will
     /// // await completion and form the next `Work` batch.
     /// match batcher.submit(batch_key, item).await {
     ///     BatchResult::Work(mut batch) => {
-    ///         db_bulk_insert(&batch.items).await?;
+    ///         db_bulk_insert(&mut batch).await?;
     ///         batch.notify_all_done();
     ///         Ok(())
     ///     }
@@ -185,8 +185,7 @@ where
         let batch_lock = {
             let mut shard = self.get_shard(&batch_key);
             let state = shard.entry_ref(&batch_key).or_default();
-            state.items.push(item);
-            state.senders.push(tx);
+            state.items.push(ItemState::Ready(tx, item));
             Arc::clone(&state.lock)
         };
 
@@ -205,8 +204,7 @@ where
                     let mut shard = self.get_shard(&batch_key);
                     let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
-                        items: mem::take(&mut state.items),
-                        senders: state.senders.drain(..).map(Some).collect(),
+                        items: state.items.drain(..).collect(),
                         queue: self.clone(),
                         batch_key,
                         local_rx: rx,
@@ -219,8 +217,7 @@ where
 }
 
 struct BatchState<Item, T> {
-    items: Vec<Item>,
-    senders: Vec<Sender<T>>,
+    items: Vec<ItemState<Item, T>>,
     lock: Arc<Semaphore>,
 }
 
@@ -230,8 +227,7 @@ type Receiver<T> = oneshot::Receiver<Option<T>>;
 impl<Item, T> Default for BatchState<Item, T> {
     fn default() -> Self {
         Self {
-            items: <_>::default(),
-            senders: <_>::default(),
+            items: Vec::default(),
             lock: Arc::new(Semaphore::new(1)),
         }
     }
@@ -256,11 +252,16 @@ pub enum BatchResult<Key: Eq + Hash + Clone, Item, T> {
     Failed,
 }
 
+enum ItemState<Item, T> {
+    Ready(Sender<T>, Item),
+    Pending(Sender<T>),
+    Done,
+}
+
 /// A batch of items to process.
 pub struct Batch<Key: Eq + Hash, Item, T> {
     /// Batch items.
-    pub items: Vec<Item>,
-    senders: Vec<Option<Sender<T>>>,
+    items: Vec<ItemState<Item, T>>,
     queue: BatchMutex<Key, Item, T>,
     batch_key: Key,
     local_rx: Receiver<T>,
@@ -272,9 +273,46 @@ where
     Item: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Items<'a, Item, T>(&'a [ItemState<Item, T>]);
+        impl<Item: fmt::Debug, T> fmt::Debug for Items<'_, Item, T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let mut l = f.debug_list();
+                for i in self.0 {
+                    if let ItemState::Ready(_, i) = i {
+                        l.entry(&i);
+                    }
+                }
+                l.finish()
+            }
+        }
+
         f.debug_struct("Batch")
-            .field("items", &self.items)
+            .field("items", &Items(&*self.items))
             .finish_non_exhaustive()
+    }
+}
+
+impl<'a, Key: Eq + Hash, Item, T> IntoIterator for &'a mut Batch<Key, Item, T> {
+    type Item = Item;
+    type IntoIter = BatchIter<'a, Item, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        BatchIter(self.items.iter_mut())
+    }
+}
+
+pub struct BatchIter<'a, Item, T>(std::slice::IterMut<'a, ItemState<Item, T>>);
+
+impl<Item, T> Iterator for BatchIter<'_, Item, T> {
+    type Item = Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for state in &mut self.0 {
+            if let ItemState::Ready(tx, item) = mem::replace(state, ItemState::Done) {
+                *state = ItemState::Pending(tx);
+                return Some(item)
+            }
+        }
+        None
     }
 }
 
@@ -288,8 +326,14 @@ impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     /// If the item is the local item, the one submitted by the same caller handling the batch,
     /// the result may be received using [`Batch::recv_local_notify_done`].
     pub fn notify_done(&mut self, item_index: usize, val: T) {
-        if let Some(tx) = self.senders.get_mut(item_index).and_then(|i| i.take()) {
-            let _ = tx.send(Some(val));
+        let state = self
+            .items
+            .get_mut(item_index)
+            .map(|i| mem::replace(i, ItemState::Done));
+        match state {
+            Some(ready @ ItemState::Ready(..)) => self.items[item_index] = ready,
+            Some(ItemState::Pending(tx)) => drop(tx.send(Some(val))),
+            _ => {}
         }
     }
 
@@ -315,7 +359,6 @@ impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
         match shard.get_mut(&self.batch_key) {
             Some(next) if !next.items.is_empty() => {
                 self.items.append(&mut next.items);
-                self.senders.extend(next.senders.drain(..).map(Some));
                 true
             }
             _ => false,
@@ -323,8 +366,11 @@ impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     }
 
     fn notify_all_failed(&mut self) {
-        for tx in &mut self.senders {
-            let _ = tx.take().map(|tx| tx.send(None));
+        for state in self.items.drain(..) {
+            match state {
+                ItemState::Ready(tx, _) | ItemState::Pending(tx) => drop(tx.send(None)),
+                ItemState::Done => (),
+            }
         }
     }
 }
@@ -336,8 +382,10 @@ impl<Key: Eq + Hash + Clone, Item> Batch<Key, Item, ()> {
     ///
     /// Convenience method when using no/`()` item return value.
     pub fn notify_all_done(&mut self) {
-        for tx in &mut self.senders {
-            let _ = tx.take().map(|tx| tx.send(Some(())));
+        for state in self.items.drain(..) {
+            if let ItemState::Pending(tx) = state {
+                let _ = tx.send(Some(()));
+            }
         }
     }
 }
@@ -347,8 +395,8 @@ impl<Key: Eq + Hash, Item, T> Drop for Batch<Key, Item, T> {
         self.notify_all_failed();
         // try to cleanup leftover states if possible
         let mut shard = self.queue.get_shard(&self.batch_key);
-        if let EntryRef::Occupied(entry) = shard.entry_ref(&self.batch_key) {
-            if Arc::strong_count(&entry.get().lock) == 1 {
+        if let EntryRef::Occupied(mut entry) = shard.entry_ref(&self.batch_key) {
+            if Arc::get_mut(&mut entry.get_mut().lock).is_some() {
                 entry.remove();
             } else {
                 // return the permit
