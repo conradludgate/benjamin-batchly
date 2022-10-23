@@ -63,17 +63,17 @@
 //! }
 //! # }
 //! ```
+use hashbrown::{hash_map::EntryRef, HashMap};
 use std::{
-    collections::{
-        hash_map::{Entry, RandomState},
-        HashMap,
-    },
-    fmt,
-    future::Future,
+    borrow::Borrow,
+    collections::hash_map::RandomState,
     hash::{BuildHasher, Hash, Hasher},
-    mem,
+    sync::{Arc, Mutex, MutexGuard},
+};
+use std::{fmt, mem};
+use std::{
+    future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 use tokio::{
@@ -94,7 +94,6 @@ pub struct BatchMutex<Key, Item, T = ()> {
     hasher: RandomState,
     queue: Arc<[Shard<Key, Item, T>]>,
 }
-type Shard<K, I, T> = Mutex<HashMap<K, BatchState<I, T>>>;
 
 impl<Key, Item, T> Clone for BatchMutex<Key, Item, T> {
     fn clone(&self) -> Self {
@@ -107,12 +106,17 @@ impl<Key, Item, T> Clone for BatchMutex<Key, Item, T> {
 
 impl<Key: Eq + Hash, Item, T> Default for BatchMutex<Key, Item, T> {
     fn default() -> Self {
-        let cap =
-            (std::thread::available_parallelism().map_or(1, usize::from) * 4).next_power_of_two();
+        // this is the same default shard size as DashMap.
+        // we are free to tinker with this and make it customisable too
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let cap = threads.next_power_of_two() * 4;
         let mut shards = Vec::with_capacity(cap);
-        shards.resize_with(cap, || Mutex::new(HashMap::new()));
+
+        let hasher = RandomState::new();
+        shards.resize_with(cap, || Mutex::new(HashMap::with_hasher(hasher.clone())));
+
         Self {
-            hasher: RandomState::new(),
+            hasher,
             queue: shards.into_boxed_slice().into(),
         }
     }
@@ -132,12 +136,12 @@ impl<Key, Item, T> BatchMutex<Key, Item, T>
 where
     Key: Eq + Hash,
 {
-    fn get_shard(&self, key: &Key) -> &Shard<Key, Item, T> {
+    fn get_shard(&self, key: &Key) -> ShardGuard<Key, Item, T> {
         let mut hasher = self.hasher.build_hasher();
         key.hash(&mut hasher);
         // queue len is always a power of two, so it should evenly divide the hash space and be fair
         let index = (hasher.finish()) as usize % self.queue.len();
-        &self.queue[index]
+        self.queue[index].lock().unwrap()
     }
 }
 
@@ -179,8 +183,8 @@ where
     pub async fn submit(&self, batch_key: Key, item: Item) -> BatchResult<Key, Item, T> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch_lock = {
-            let mut shard = self.get_shard(&batch_key).lock().unwrap();
-            let state = shard.entry(batch_key.clone()).or_default();
+            let mut shard = self.get_shard(&batch_key);
+            let state = shard.entry_ref(&batch_key).or_default();
             state.items.push(item);
             state.senders.push(tx);
             Arc::clone(&state.lock)
@@ -198,13 +202,13 @@ where
                     guard.forget()
                 }
                 let batch = {
-                    let mut shard = self.get_shard(&batch_key).lock().unwrap();
+                    let mut shard = self.get_shard(&batch_key);
                     let state = shard.get_mut(&batch_key).unwrap(); // should always exist in queue at this point
                     Batch {
                         items: mem::take(&mut state.items),
                         senders: state.senders.drain(..).map(Some).collect(),
                         queue: self.clone(),
-                        key: Some(batch_key),
+                        batch_key,
                         local_rx: rx,
                     }
                 };
@@ -258,7 +262,7 @@ pub struct Batch<Key: Eq + Hash, Item, T> {
     pub items: Vec<Item>,
     senders: Vec<Option<Sender<T>>>,
     queue: BatchMutex<Key, Item, T>,
-    key: Option<Key>,
+    batch_key: Key,
     local_rx: Receiver<T>,
 }
 
@@ -307,18 +311,14 @@ impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     ///
     /// Returns `true` if any new items were pulled in.
     pub fn pull_waiting_items(&mut self) -> bool {
-        if let Some(key) = self.key.as_ref() {
-            let mut shard = self.queue.get_shard(key).lock().unwrap();
-            match shard.get_mut(key) {
-                Some(next) if !next.items.is_empty() => {
-                    self.items.append(&mut next.items);
-                    self.senders.extend(next.senders.drain(..).map(Some));
-                    true
-                }
-                _ => false,
+        let mut shard = self.queue.get_shard(&self.batch_key);
+        match shard.get_mut(&self.batch_key) {
+            Some(next) if !next.items.is_empty() => {
+                self.items.append(&mut next.items);
+                self.senders.extend(next.senders.drain(..).map(Some));
+                true
             }
-        } else {
-            false
+            _ => false,
         }
     }
 
@@ -346,15 +346,13 @@ impl<Key: Eq + Hash, Item, T> Drop for Batch<Key, Item, T> {
     fn drop(&mut self) {
         self.notify_all_failed();
         // try to cleanup leftover states if possible
-        if let Some(key) = self.key.take() {
-            let mut shard = self.queue.get_shard(&key).lock().unwrap();
-            if let Entry::Occupied(entry) = shard.entry(key) {
-                if Arc::strong_count(&entry.get().lock) == 1 {
-                    entry.remove();
-                } else {
-                    // return the permit
-                    entry.get().lock.add_permits(1);
-                }
+        let mut shard = self.queue.get_shard(&self.batch_key);
+        if let EntryRef::Occupied(entry) = shard.entry_ref(&self.batch_key) {
+            if Arc::strong_count(&entry.get().lock) == 1 {
+                entry.remove();
+            } else {
+                // return the permit
+                entry.get().lock.add_permits(1);
             }
         }
     }
@@ -398,3 +396,23 @@ where
         Poll::Pending
     }
 }
+
+/// Key wrapper. For use with `entry_ref`
+/// which uses `From<&K>` to generate the key on insert
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Key<K>(K);
+
+impl<K: Clone> From<&'_ K> for Key<K> {
+    fn from(k: &'_ K) -> Self {
+        Self(k.clone())
+    }
+}
+
+impl<K> Borrow<K> for Key<K> {
+    fn borrow(&self) -> &K {
+        &self.0
+    }
+}
+
+type Shard<K, I, T> = Mutex<HashMap<Key<K>, BatchState<I, T>, RandomState>>;
+type ShardGuard<'a, K, I, T> = MutexGuard<'a, HashMap<Key<K>, BatchState<I, T>, RandomState>>;
