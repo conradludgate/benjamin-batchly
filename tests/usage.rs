@@ -181,13 +181,10 @@ async fn lock_30ms_pull_waiting_items_and_handle_in_50ms(
         BatchResult::Done(_) => (HandleResult::Done(()), Instant::now()),
         BatchResult::Failed => (HandleResult::Failed, Instant::now()),
         BatchResult::Work(mut batch) => {
-            let mut items: Vec<_> = batch.into_iter().collect();
-            assert_eq!(items[0], item);
-
             // simuluate some initial io (like a distributed lock)
             tokio::time::sleep(Duration::from_millis(30)).await;
-            batch.pull_waiting_items();
-            items.extend(&mut batch);
+
+            let items: Vec<_> = batch.into_iter().collect();
 
             // simuluate some io
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -237,7 +234,7 @@ async fn handle_convert_to_u32_if_even(
                 }
             }
 
-            match batch.recv_local_notify_done() {
+            match batch.finish() {
                 Some(v) => ToU32Result::DidWork(v),
                 None => ToU32Result::RecvLocalErr,
             }
