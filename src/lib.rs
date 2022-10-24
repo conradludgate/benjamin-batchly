@@ -71,15 +71,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use std::{fmt, mem};
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
-use tokio::{
-    pin,
-    sync::{futures::Notified, AcquireError, Notify, Semaphore, SemaphorePermit},
-};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Batch HQ. Share and use concurrently to dynamically batch submitted items.
 ///
@@ -182,74 +174,55 @@ where
     /// ```
     pub async fn submit(&self, batch_key: Key, item: Item) -> BatchResult<Key, Item, T> {
         let idx;
-        let notify;
-        let shared_state = {
+        let shared_state;
+        {
             let mut shard = self.get_shard(&batch_key);
             let state = shard.entry_ref(&batch_key).or_default();
-            idx = state.inner.items.len();
-            state.inner.items.push(ItemState::Ready(item));
-            notify = Arc::clone(&state.inner.notified);
-            Arc::clone(&state.shared)
+            shared_state = Arc::clone(&state.shared);
+            idx = state.items.len();
+            state.items.push(ItemState::Ready(item));
         };
 
-        let permit = shared_state.permit.acquire();
-        let notified = notify.notified();
-        pin!(notified, permit);
+        let guard = shared_state
+            .permit
+            .acquire()
+            .await
+            .expect("we never close the semaphore so this should never error");
+        guard.forget();
 
-        match WorkPermitSelect::new(notified, permit).await {
-            WorkPermit::Done => {
-                match mem::replace(
-                    &mut shared_state.inner.lock().unwrap().items[idx],
-                    ItemState::Pending,
-                ) {
-                    ItemState::Done(t) => BatchResult::Done(t),
-                    _ => BatchResult::Failed,
-                }
-            }
-            WorkPermit::Permit => {
-                let batch = {
-                    Batch {
-                        queue: self.clone(),
-                        batch_key,
-                        idx,
-                    }
-                };
-                BatchResult::Work(batch)
+        if idx == 0 {
+            BatchResult::Work(Batch {
+                queue: self.clone(),
+                batch_key,
+            })
+        } else {
+            match mem::replace(
+                &mut shared_state.items.lock().unwrap()[idx],
+                ItemState::Pending,
+            ) {
+                ItemState::Done(t) => BatchResult::Done(t),
+                _ => BatchResult::Failed,
             }
         }
     }
 }
 
 struct BatchState<Item, T> {
-    inner: BatchStateInner<Item, T>,
+    items: Vec<ItemState<Item, T>>,
     shared: Arc<BatchSharedState<Item, T>>,
 }
 
-struct BatchStateInner<Item, T> {
-    items: Vec<ItemState<Item, T>>,
-    notified: Arc<Notify>,
-}
-
-impl<Item, T> Default for BatchStateInner<Item, T> {
-    fn default() -> Self {
-        Self {
-            items: Vec::default(),
-            notified: <_>::default(),
-        }
-    }
-}
-
 struct BatchSharedState<Item, T> {
-    inner: Mutex<BatchStateInner<Item, T>>,
+    items: Mutex<Vec<ItemState<Item, T>>>,
     permit: Semaphore,
 }
 
 impl<Item, T> Default for BatchState<Item, T> {
     fn default() -> Self {
         Self {
-            inner: <_>::default(),
+            items: <_>::default(),
             shared: Arc::new(BatchSharedState {
-                inner: <_>::default(),
+                items: <_>::default(),
                 permit: Semaphore::new(1),
             }),
         }
@@ -285,7 +258,6 @@ enum ItemState<Item, T> {
 pub struct Batch<Key: Eq + Hash, Item, T> {
     queue: BatchMutex<Key, Item, T>,
     batch_key: Key,
-    idx: usize,
 }
 
 impl<Key, Item, T> fmt::Debug for Batch<Key, Item, T>
@@ -306,13 +278,11 @@ impl<'a, Key: Eq + Hash, Item, T> IntoIterator for &'a mut Batch<Key, Item, T> {
         let entry = shard.get_mut(&self.batch_key).unwrap();
 
         let shared = entry.shared.clone();
-        let mut output = shared.inner.lock().unwrap();
+        let mut output = shared.items.lock().unwrap();
 
         // take from the items now
-        output.items.clear();
-        mem::swap(&mut *output, &mut entry.inner);
-        let range = dbg!(0..output.items.len());
-        dbg!(entry.inner.items.len());
+        mem::swap(&mut *output, &mut entry.items);
+        let range = 0..output.len();
 
         drop(shard);
         drop(output);
@@ -330,12 +300,12 @@ impl<Item, T> Iterator for BatchIter<Item, T> {
     type Item = Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut output = self.shared.inner.lock().unwrap();
+        let mut output = self.shared.items.lock().unwrap();
         for index in &mut self.range {
-            let state = &mut output.items[index];
+            let state = &mut output[index];
             match mem::replace(state, ItemState::Pending) {
                 ItemState::Ready(item) => return Some(item),
-                state => output.items[index] = state,
+                state => output[index] = state,
             }
         }
         None
@@ -354,9 +324,8 @@ impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     pub fn notify_done(&mut self, item_index: usize, val: T) {
         let mut shard = self.queue.get_shard(&self.batch_key);
         let entry = shard.get_mut(&self.batch_key).unwrap();
-        let mut output = entry.shared.inner.lock().unwrap();
+        let mut output = entry.shared.items.lock().unwrap();
         output
-            .items
             .get_mut(item_index)
             .map(|i| mem::replace(i, ItemState::Done(val)));
     }
@@ -371,8 +340,8 @@ impl<Key: Eq + Hash, Item, T> Batch<Key, Item, T> {
     pub fn finish(self) -> Option<T> {
         let mut shard = self.queue.get_shard(&self.batch_key);
         let entry = shard.get_mut(&self.batch_key).unwrap();
-        let mut output = entry.shared.inner.lock().unwrap();
-        match mem::replace(&mut output.items[self.idx], ItemState::Pending) {
+        let mut output = entry.shared.items.lock().unwrap();
+        match mem::replace(&mut output[0], ItemState::Pending) {
             ItemState::Ready(_) | ItemState::Pending => None,
             ItemState::Done(val) => Some(val),
         }
@@ -405,8 +374,8 @@ impl<Key: Eq + Hash + Clone, Item> Batch<Key, Item, ()> {
     pub fn notify_all_done(&mut self) {
         let mut shard = self.queue.get_shard(&self.batch_key);
         let entry = shard.get_mut(&self.batch_key).unwrap();
-        let mut output = entry.shared.inner.lock().unwrap();
-        for item in &mut output.items {
+        let mut output = entry.shared.items.lock().unwrap();
+        for item in output.iter_mut() {
             let _ = mem::replace(item, ItemState::Done(()));
         }
     }
@@ -417,64 +386,21 @@ impl<Key: Eq + Hash, Item, T> Drop for Batch<Key, Item, T> {
         // try to cleanup leftover states if possible
         let mut shard = self.queue.get_shard(&self.batch_key);
         if let EntryRef::Occupied(mut entry) = shard.entry_ref(&self.batch_key) {
-            entry
+            let len = entry.get_mut().shared.items.lock().unwrap().len();
+            entry.get().shared.permit.add_permits(len);
+
+            // remove entry if no one else is waiting for this permit
+            if entry
                 .get_mut()
                 .shared
-                .inner
-                .lock()
-                .unwrap()
-                .notified
-                .notify_waiters();
-            if Arc::get_mut(&mut entry.get_mut().shared).is_some() {
+                .permit
+                .try_acquire()
+                .map(SemaphorePermit::forget)
+                .is_ok()
+            {
                 entry.remove();
-            } else {
-                // return the permit
-                entry.get().shared.permit.add_permits(1);
             }
         }
-    }
-}
-
-enum WorkPermit {
-    Done,
-    Permit,
-}
-
-struct WorkPermitSelect<'a, 'b, Acquire> {
-    inner: Option<(Pin<&'a mut Notified<'b>>, Pin<&'a mut Acquire>)>,
-}
-
-impl<'a, 'b, Acquire> WorkPermitSelect<'a, 'b, Acquire> {
-    fn new(rx: Pin<&'a mut Notified<'b>>, acq: Pin<&'a mut Acquire>) -> Self {
-        Self {
-            inner: Some((rx, acq)),
-        }
-    }
-}
-
-impl<'a, Acquire> Future for WorkPermitSelect<'_, '_, Acquire>
-where
-    Acquire: Future<Output = Result<SemaphorePermit<'a>, AcquireError>>,
-{
-    type Output = WorkPermit;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (mut a, mut b) = self.inner.take().expect("cannot poll Select twice");
-
-        if let Poll::Ready(()) = Pin::new(&mut a).poll(cx) {
-            return Poll::Ready(WorkPermit::Done);
-        }
-
-        if let Poll::Ready(guard) = b.as_mut().poll(cx) {
-            if let Ok(guard) = guard {
-                // we return the permit in `Batch::drop`
-                guard.forget()
-            }
-            return Poll::Ready(WorkPermit::Permit);
-        }
-
-        self.inner = Some((a, b));
-        Poll::Pending
     }
 }
 
